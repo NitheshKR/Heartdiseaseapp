@@ -1,11 +1,11 @@
-# app.py - Debug-friendly & robust Streamlit app for Heart Disease prediction
+# app.py
 import os
 import streamlit as st
 import joblib
 import numpy as np
 import pandas as pd
 
-# Try to import optional libs
+# optional imports (onnxruntime or tf)
 try:
     import onnxruntime as ort
 except Exception:
@@ -18,233 +18,212 @@ except Exception:
 
 from sklearn.preprocessing import StandardScaler
 
-# ----------------- Config -----------------
-DEBUG = True   # Set False to hide detailed debug outputs in the UI
+# ---------- Config ----------
 SELECTED_FEATURES_PATH = "selected_features.joblib"
 SCALER_JOBLIB_PATH = "scaler.joblib"
 SCALER_PARAMS_PATH = "scaler_params.npz"
+CSV_PATH = "heart_disease_health_indicators.csv"  # used only if scaler needs rebuilding
 ONNX_PATH = "heart_model.onnx"
-HDF5_PATH = "heart_disease_model.h5"  # fallback
-# ------------------------------------------
+HDF5_PATH = "heart_disease_model.h5"
+# expected number of features (11)
+EXPECTED_FEATURE_LEN = 11
 
-st.set_page_config(page_title="Heart Disease Risk (Debug)", layout="centered")
-st.title("Heart Disease Prediction — Debug Mode" if DEBUG else "Heart Disease Prediction")
+# default selected features (fallback)
+DEFAULT_SELECTED = [
+    'HighBP','HighChol','CholCheck','BMI','Smoker','Stroke',
+    'Diabetes','PhysActivity','HvyAlcoholConsump','Sex','Age'
+]
+# ----------------------------
 
-# ----------------- Helpers -----------------
+st.set_page_config(page_title="Heart Disease Risk Predictor", layout="centered")
+st.title("Heart Disease Risk Predictor")
+
 def load_selected_features(path=SELECTED_FEATURES_PATH):
-    try:
-        selected = joblib.load(path)
-        if not isinstance(selected, (list, tuple, np.ndarray)):
-            raise ValueError("selected_features loaded but not a list")
-        return list(selected)
-    except Exception as e:
-        st.warning(f"Could not load selected features from '{path}': {e}. Using default 11 features.")
-        return ['HighBP','HighChol','CholCheck','BMI','Smoker','Stroke','Diabetes','PhysActivity','HvyAlcoholConsump','Sex','Age']
-
-def load_scaler_safe(joblib_path=SCALER_JOBLIB_PATH, params_path=SCALER_PARAMS_PATH):
-    # Try joblib first
-    try:
-        scaler = joblib.load(joblib_path)
-        if DEBUG: st.write(f"Loaded scaler from {joblib_path} (type: {type(scaler)})")
-        return scaler, "joblib"
-    except Exception as e_job:
-        if DEBUG: st.write(f"joblib.load failed: {e_job}")
-        # fallback to params file
+    if os.path.exists(path):
         try:
-            npz = np.load(params_path)
-            mean = npz['mean']
-            scale = npz['scale']
-            # reconstruct StandardScaler
-            scaler = StandardScaler()
-            scaler.mean_ = np.array(mean)
-            scaler.scale_ = np.array(scale)
-            scaler.var_ = scaler.scale_ ** 2
-            scaler.n_features_in_ = len(scaler.mean_)
-            if DEBUG: st.write(f"Reconstructed StandardScaler from {params_path}")
-            return scaler, "params"
-        except Exception as e_params:
-            # final fallback: return None and error
-            raise RuntimeError(f"Failed to load scaler from joblib ({e_job}) and params ({e_params}). Upload scaler.joblib or scaler_params.npz.")
+            sel = joblib.load(path)
+            if isinstance(sel, (list, tuple, np.ndarray)):
+                return list(sel)
+        except Exception:
+            pass
+    return DEFAULT_SELECTED
+
+def save_scaler_params(scaler, params_path=SCALER_PARAMS_PATH):
+    if hasattr(scaler, "mean_") and hasattr(scaler, "scale_"):
+        np.savez(params_path, mean=scaler.mean_, scale=scaler.scale_)
+
+def rebuild_scaler_from_csv(csv_path=CSV_PATH, selected=None):
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"CSV file for rebuilding scaler not found at '{csv_path}'. Upload it to the app folder or provide scaler_params.npz.")
+    df = pd.read_csv(csv_path)
+    # ensure selected features exist
+    missing = [c for c in selected if c not in df.columns]
+    if missing:
+        raise ValueError(f"CSV missing required columns for scaler rebuild: {missing}")
+    X = df[selected].copy()
+    # convert textual categories to numeric if necessary
+    if X['Sex'].dtype == object:
+        X['Sex'] = X['Sex'].map({'Male':1, 'Female':0}).fillna(0).astype(int)
+    for c in ['HighBP','HighChol','CholCheck','Smoker','Stroke','Diabetes','PhysActivity','HvyAlcoholConsump']:
+        if X[c].dtype == object:
+            X[c] = X[c].map({'Yes':1, 'No':0}).fillna(0).astype(int)
+    scaler = StandardScaler().fit(X.values.astype(float))
+    # save portable params
+    save_scaler_params(scaler)
+    return scaler
+
+def load_scaler(joblib_path=SCALER_JOBLIB_PATH, params_path=SCALER_PARAMS_PATH, selected=None):
+    # Try joblib
+    if os.path.exists(joblib_path):
+        try:
+            scaler = joblib.load(joblib_path)
+            if hasattr(scaler, "mean_") and len(scaler.mean_) == EXPECTED_FEATURE_LEN:
+                return scaler
+        except Exception:
+            pass
+    # Try params file
+    if os.path.exists(params_path):
+        try:
+            d = np.load(params_path)
+            mean = d['mean']
+            scale = d['scale']
+            if len(mean) == EXPECTED_FEATURE_LEN:
+                scaler = StandardScaler()
+                scaler.mean_ = mean
+                scaler.scale_ = scale
+                scaler.var_ = scaler.scale_ ** 2
+                scaler.n_features_in_ = len(mean)
+                return scaler
+        except Exception:
+            pass
+    # If we reach here, attempt rebuild from CSV if available
+    if os.path.exists(CSV_PATH):
+        try:
+            scaler = rebuild_scaler_from_csv(csv_path=CSV_PATH, selected=selected)
+            return scaler
+        except Exception as e:
+            raise RuntimeError(f"Failed to rebuild scaler from CSV: {e}")
+    raise RuntimeError("No usable scaler found. Upload 'scaler.joblib' or 'scaler_params.npz', or upload the dataset CSV to rebuild the scaler.")
 
 def fix_zero_scales(scaler):
-    """
-    Replace zero scales with a small epsilon to avoid division by zero during transform.
-    Updates scaler in-place.
-    """
-    if not hasattr(scaler, 'scale_'):
-        return scaler, False
-    scale = np.array(getattr(scaler, 'scale_', None))
-    if scale is None:
-        return scaler, False
-    zeros = (scale == 0)
+    if not hasattr(scaler, "scale_"):
+        return scaler
+    scale = np.array(scaler.scale_)
+    zeros = scale == 0
     if np.any(zeros):
-        eps = 1e-6
-        scale_fixed = np.where(zeros, eps, scale)
-        scaler.scale_ = scale_fixed
+        scale[zeros] = 1e-6
+        scaler.scale_ = scale
         scaler.var_ = scaler.scale_ ** 2
-        # n_features_in_ should already be set
-        return scaler, True
-    return scaler, False
+    return scaler
 
-def load_model_auto(onnx_path=ONNX_PATH, h5_path=HDF5_PATH):
-    # Try ONNX
+def load_model_prefer(onnx_path=ONNX_PATH, h5_path=HDF5_PATH):
+    # prefer ONNX for lighter runtime
     if os.path.exists(onnx_path) and ort is not None:
         sess = ort.InferenceSession(onnx_path)
         input_name = sess.get_inputs()[0].name
         return ("onnx", sess, input_name)
-    # Else try HDF5 / Keras model
+    # try HDF5 keras model
     if os.path.exists(h5_path) and load_model is not None:
         model = load_model(h5_path)
         return ("keras", model, None)
-    # Nothing found
+    # nothing found
     return (None, None, None)
 
-def preprocess_input_dict(values_dict, selected_features, scaler):
-    # build df with correct column order
-    row = pd.DataFrame([values_dict], columns=selected_features)
-    # try to map common string categories to numeric
-    mapping = {"Yes":1, "No":0, "Male":1, "Female":0}
-    for c in selected_features:
-        # if dtype/object try mapping
-        if row[c].dtype == object or isinstance(row.loc[0, c], str):
-            row[c] = row[c].map(mapping).fillna(row[c])
-    # convert to numeric
-    try:
-        X_raw = row.values.astype(float)
-    except Exception as e:
-        raise ValueError(f"Could not convert input row to floats: {e}\nRow was: {row.to_dict(orient='records')}")
-    # scale
-    X_scaled = scaler.transform(X_raw)
-    return X_raw, X_scaled
-
-# ----------------- Load artifacts -----------------
+# Load selected features
 selected_features = load_selected_features()
-st.sidebar.write("Model input features (order):")
-st.sidebar.write(selected_features)
+if len(selected_features) != EXPECTED_FEATURE_LEN:
+    # if stored selected_features lists dummified columns etc., fallback to default
+    selected_features = DEFAULT_SELECTED
 
+# Load or rebuild scaler
 try:
-    scaler, scaler_src = load_scaler_safe()
+    scaler = load_scaler(selected=selected_features)
+    scaler = fix_zero_scales(scaler)
 except Exception as e:
-    st.error(str(e))
+    st.error(f"Scaler loading error: {e}")
     st.stop()
 
-# fix zero scales if any
-scaler, fixed = fix_zero_scales(scaler)
-if fixed and DEBUG:
-    st.warning("Detected zero scale values in scaler; replaced with small epsilon to avoid divide-by-zero.")
-
-# load model (ONNX preferred)
-model_kind, model_obj, model_input_name = load_model_auto()
+# Load model
+model_kind, model_obj, model_input_name = load_model_prefer()
 if model_kind is None:
-    st.error("No model found in app folder. Please upload 'heart_model.onnx' (preferred) or 'heart_disease_model.h5'.")
+    st.error("No model found in app folder. Upload 'heart_model.onnx' (preferred) or 'heart_disease_model.h5'.")
     st.stop()
-else:
-    st.sidebar.write(f"Loaded model type: {model_kind}")
 
-# ----------------- UI Inputs -----------------
-st.subheader("Enter patient data")
+# UI inputs
+st.subheader("Enter patient information")
 col1, col2 = st.columns(2)
 with col1:
-    age = st.number_input("Age", min_value=1, max_value=120, value=50)
-    sex = st.selectbox("Sex", ["Male","Female"])
-    highbp = st.selectbox("HighBP", ["Yes","No"])
-    highchol = st.selectbox("HighChol", ["Yes","No"])
-    cholcheck = st.selectbox("CholCheck", ["Yes","No"])
+    age = st.number_input("Age", 1, 120, value=50)
+    sex = st.selectbox("Sex", ["Male", "Female"])
+    highbp = st.selectbox("HighBP (High blood pressure?)", ["Yes","No"])
+    highchol = st.selectbox("HighChol (High cholesterol?)", ["Yes","No"])
+    cholcheck = st.selectbox("CholCheck (Cholesterol checked?)", ["Yes","No"])
 with col2:
-    bmi = st.number_input("BMI", min_value=10.0, max_value=60.0, value=25.26, format="%.2f")
+    bmi = st.number_input("BMI", 10.0, 60.0, value=25.26, format="%.2f")
     smoker = st.selectbox("Smoker", ["Yes","No"])
-    stroke = st.selectbox("Stroke", ["Yes","No"])
+    stroke = st.selectbox("Stroke (history)?", ["Yes","No"])
     diabetes = st.selectbox("Diabetes", ["Yes","No"])
-    phys = st.selectbox("PhysActivity", ["Yes","No"])
-    hvyalc = st.selectbox("HvyAlcoholConsump", ["Yes","No"])
+    phys = st.selectbox("PhysActivity (Physically active?)", ["Yes","No"])
+    hvyalc = st.selectbox("HvyAlcoholConsump (Heavy alcohol?)", ["Yes","No"])
 
-# build the ordered dict
+# Build input dict in expected order
 values = {
-    "HighBP": 1 if highbp=="Yes" else 0,
-    "HighChol": 1 if highchol=="Yes" else 0,
-    "CholCheck": 1 if cholcheck=="Yes" else 0,
+    "HighBP": 1 if highbp == "Yes" else 0,
+    "HighChol": 1 if highchol == "Yes" else 0,
+    "CholCheck": 1 if cholcheck == "Yes" else 0,
     "BMI": float(bmi),
-    "Smoker": 1 if smoker=="Yes" else 0,
-    "Stroke": 1 if stroke=="Yes" else 0,
-    "Diabetes": 1 if diabetes=="Yes" else 0,
-    "PhysActivity": 1 if phys=="Yes" else 0,
-    "HvyAlcoholConsump": 1 if hvyalc=="Yes" else 0,
-    "Sex": 1 if sex=="Male" else 0,
+    "Smoker": 1 if smoker == "Yes" else 0,
+    "Stroke": 1 if stroke == "Yes" else 0,
+    "Diabetes": 1 if diabetes == "Yes" else 0,
+    "PhysActivity": 1 if phys == "Yes" else 0,
+    "HvyAlcoholConsump": 1 if hvyalc == "Yes" else 0,
+    "Sex": 1 if sex == "Male" else 0,
     "Age": int(age)
 }
 
-st.markdown("### Inputs (ordered)")
-st.json(values)
-
-# ----------------- Predict & Debug -----------------
 if st.button("Predict"):
-    # Preprocess & debug
+    # prepare row
+    row = pd.DataFrame([values], columns=selected_features)
+    # ensure mapping & numeric
+    mapping = {"Yes":1, "No":0, "Male":1, "Female":0}
+    for c in selected_features:
+        if row[c].dtype == object:
+            row[c] = row[c].map(mapping).fillna(row[c])
     try:
-        X_raw, X_scaled = preprocess_input_dict(values, selected_features, scaler)
+        X_raw = row.values.astype(float)
     except Exception as e:
-        st.error(f"Preprocessing error: {e}")
-        if DEBUG:
-            st.exception(e)
+        st.error(f"Input conversion error: {e}")
+        st.stop()
+    # scale
+    try:
+        X_scaled = scaler.transform(X_raw)
+    except Exception as e:
+        st.error(f"Scaler transform failed: {e}. You may need to upload a correct 'scaler_params.npz' or the dataset CSV so the app can rebuild the scaler.")
         st.stop()
 
-    # Debug prints
-    if DEBUG:
-        st.write("X_raw (before scaling):")
-        st.write(X_raw)
-        st.write("scaler.mean_ (length):", getattr(scaler, 'mean_', None).shape if hasattr(scaler, 'mean_') else None)
-        st.write("scaler.mean_:", getattr(scaler, 'mean_', None))
-        st.write("scaler.scale_ (length):", getattr(scaler, 'scale_', None).shape if hasattr(scaler, 'scale_') else None)
-        st.write("scaler.scale_:", getattr(scaler, 'scale_', None))
-        st.write("X_scaled (after scaling):")
-        st.write(X_scaled)
-        # check for NaN/Inf
-        if np.any(np.isnan(X_raw)) or np.any(np.isinf(X_raw)):
-            st.error("ERROR: X_raw contains NaN or Inf.")
-        if np.any(np.isnan(X_scaled)) or np.any(np.isinf(X_scaled)):
-            st.error("ERROR: X_scaled contains NaN or Inf. Check scaler parameters or feature order.")
-            st.stop()
-
-    # Run prediction
+    # model predict
     try:
         if model_kind == "onnx":
-            # ONNX expects float32
-            inp = {model_input_name: X_scaled.astype(np.float32)}
-            preds = model_obj.run(None, inp)[0]
+            pred = model_obj.run(None, {model_input_name: X_scaled.astype(np.float32)})[0]
         else:
-            preds = model_obj.predict(X_scaled)
+            pred = model_obj.predict(X_scaled)
     except Exception as e:
         st.error(f"Model prediction error: {e}")
-        if DEBUG:
-            st.exception(e)
         st.stop()
 
-    # Show raw preds and handle NaN
-    if DEBUG:
-        st.write("Raw model output (preds):")
-        st.write(preds)
-
-    if np.any(np.isnan(preds)) or np.any(np.isinf(preds)):
-        st.error("Model produced NaN or Inf predictions. See debug outputs above.")
-        st.stop()
-
-    # flatten to scalar prob
+    # parse probability
     try:
-        prob = float(np.ravel(preds)[0])
+        prob = float(np.ravel(pred)[0])
     except Exception as e:
-        st.error(f"Could not parse model output to scalar: {e}")
-        if DEBUG:
-            st.exception(e)
+        st.error(f"Could not parse model output: {e}")
         st.stop()
 
-    if np.isnan(prob):
-        st.error("Prediction is NaN. See debug outputs above.")
+    if np.isnan(prob) or np.isinf(prob):
+        st.error("Model returned an invalid probability (NaN or Inf). Consider rebuilding scaler from Colab and uploading scaler_params.npz.")
         st.stop()
 
-    st.metric("Predicted risk (%)", f"{prob*100:.2f}%")
-    st.success("Risk level: " + ("High" if prob > 0.7 else "Medium" if prob > 0.4 else "Low"))
-    st.caption("Disclaimer: Demo only — not medical advice.")
-
-    st.metric("Predicted risk (%)", f"{prob*100:.2f}%")
-    st.success("Risk level: " + ("High" if prob>0.7 else "Medium" if prob>0.4 else "Low"))
-    st.caption("Disclaimer: Demo only — not medical advice.")
-
+    pct = prob * 100.0
+    st.metric("Predicted heart disease risk (%)", f"{pct:.2f}%")
+    level = "High" if prob > 0.7 else "Medium" if prob > 0.4 else "Low"
+    st.success(f"Risk level: {level}")
+    st.caption("Disclaimer: This is a demo tool for educational purposes; not medical advice.")
