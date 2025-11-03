@@ -1,5 +1,6 @@
 streamlit
-tensorflow
+onnxruntime
+scikit-learn
+pandas
 joblib
 numpy
-scikit-learn==1.2.2
